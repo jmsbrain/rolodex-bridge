@@ -36,6 +36,9 @@ data class Person(val names: Set<String>, val phones: Set<String>, val emails: S
 
         /** Last 10 digits, so +1 919… and (919)… match. Short codes are ignored. */
         fun phoneKey(s: String): String? = s.filter { it.isDigit() }.takeIf { it.length >= 7 }?.takeLast(10)
+
+        /** Same number on two entries: like [phoneKey], but short codes and odd text count too, matched exactly. */
+        fun numberKey(s: String): String? = phoneKey(s) ?: s.trim().takeIf { it.isNotEmpty() }?.let { "=" + it }
     }
 }
 

@@ -246,7 +246,7 @@ object Bridge {
             val card = clean.getValue(target.key)
             val existing = target.value.rows().filter { it.mime == Phone.CONTENT_ITEM_TYPE }
             val have = phoneKeys(existing).toSet()
-            val add = phones.filter { p -> Person.phoneKey(p[Phone.NUMBER].orEmpty()).let { it == null || it !in have } }
+            val add = phones.filter { p -> Person.numberKey(p[Phone.NUMBER].orEmpty()).let { it != null && it !in have } }
             if (add.isEmpty()) return
             url = card.url
             sent = phoneKeys(add)
@@ -302,7 +302,7 @@ object Bridge {
     // ---- plumbing ----
 
     private fun phoneKeys(rows: List<SyncRow>): List<String> =
-        rows.filter { it.mime == Phone.CONTENT_ITEM_TYPE }.mapNotNull { Person.phoneKey(it[Phone.NUMBER].orEmpty()) }.distinct()
+        rows.filter { it.mime == Phone.CONTENT_ITEM_TYPE }.mapNotNull { Person.numberKey(it[Phone.NUMBER].orEmpty()) }.distinct()
 
     private fun say(text: String) {
         _progress.value = text

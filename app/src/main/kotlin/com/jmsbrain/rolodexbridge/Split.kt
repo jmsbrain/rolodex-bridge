@@ -12,7 +12,7 @@ import android.provider.ContactsContract.CommonDataKinds.StructuredName
 data class Piece(val key: String, val rows: List<SyncRow>) {
     /** Changes whenever the entry's content does. */
     val hash: String get() = rows.map { it.sortKey }.sorted().joinToString("\u0001").hashCode().toString(16)
-    val phoneKey: String? get() = rows.firstOrNull { it.mime == Phone.CONTENT_ITEM_TYPE }?.let { Person.phoneKey(it[Phone.NUMBER].orEmpty()) }
+    val phoneKey: String? get() = rows.firstOrNull { it.mime == Phone.CONTENT_ITEM_TYPE }?.let { Person.numberKey(it[Phone.NUMBER].orEmpty()) }
 }
 
 /** A contact rebuilt from LightOS entries: one name, its numbers, and anything else they held. */

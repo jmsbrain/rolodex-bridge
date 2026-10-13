@@ -35,6 +35,14 @@ class SplitTest {
         assertFalse(person(name("Evelyn Okafor")).matches(person(name("Evelyn Okafore"))))
     }
 
+    @Test fun shortNumbersMatchEntriesExactlyButNeverPeople() {
+        assertEquals("=24273", Person.numberKey("24273"))
+        assertEquals(Person.numberKey("+1 919 555 0101"), Person.numberKey("(919) 555-0101"))
+        assertNull(Person.numberKey("  "))
+        assertFalse(person(phone("24273", 2)).matches(person(phone("24273", 2))))
+        assertEquals("=24273", Splitter.pieces("card", listOf(name("Pharmacy"), phone("24273", 2))).single().phoneKey)
+    }
+
     // ---- splitting ----
 
     @Test fun oneNumberStaysWhole() {
