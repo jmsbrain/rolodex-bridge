@@ -28,6 +28,8 @@ class CardDav(user: String, password: String) {
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
+        // A stalled answer fails instead of hanging.
+        .callTimeout(3, TimeUnit.MINUTES)
         .addInterceptor { chain -> chain.proceed(chain.request().newBuilder().header("Authorization", auth).build()) }
         .build()
 

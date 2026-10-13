@@ -81,9 +81,9 @@ object Bridge {
         }
 
         // ---- Clean Contacts ----
-        say("Reading ${Settings.mainBookName(ctx)}…")
-        refreshClean(dav, mainBook, clean)
-        if (!dryRun) State.saveClean(ctx, clean)
+        refreshClean(dav, mainBook, clean) { done, total -> say("Reading ${Settings.mainBookName(ctx)}: $done of $total") }
+        // Only a cache, so the preview keeps it too and BUILD doesn't download everything again.
+        State.saveClean(ctx, clean)
         var docs = parse(clean)
         var desired = piecesOf(docs)
         var covered = desired.values.mapNotNull { it.phoneKey }.toSet()
@@ -215,13 +215,17 @@ object Bridge {
     // ---- Clean Contacts ----
 
     /** Brings [clean] up to date with the server, downloading only cards that changed. */
-    private fun refreshClean(dav: CardDav, book: String, clean: MutableMap<String, CleanCard>) {
+    private fun refreshClean(dav: CardDav, book: String, clean: MutableMap<String, CleanCard>, progress: (Int, Int) -> Unit = { _, _ -> }) {
         val listing = dav.list(book)
         val byKey = listing.keys.associateBy { key(it) }
         clean.keys.retainAll(byKey.keys)
         val stale = byKey.filter { (k, url) -> clean[k]?.let { it.etag == null || it.etag != listing[url] } ?: true }
-        for (chunk in stale.values.chunked(100)) {
+        var done = 0
+        progress(0, stale.size)
+        for (chunk in stale.values.chunked(50)) {
             for (f in dav.multiget(book, chunk)) clean[key(f.url)] = CleanCard(f.url, f.etag, f.text)
+            done += chunk.size
+            progress(done, stale.size)
         }
     }
 
