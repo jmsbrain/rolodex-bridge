@@ -93,19 +93,35 @@ class PhoneContacts(private val resolver: ContentResolver) {
             .withValue(RawContacts.ACCOUNT_NAME, book.name)
             .withValue(RawContacts.ACCOUNT_TYPE, book.type)
             .build()
-        for (row in rows) {
-            val b = ContentProviderOperation.newInsert(Data.CONTENT_URI)
-                .withValueBackReference(Data.RAW_CONTACT_ID, 0)
-                .withValue(Data.MIMETYPE, row.mime)
-            row.values.forEach { (k, v) -> b.withValue(k, v) }
-            // A name with no parts (a company, an email address): keep it whole, or Android splits it.
-            if (row.mime == StructuredName.CONTENT_ITEM_TYPE && row.values.keys == setOf(StructuredName.DISPLAY_NAME)) {
-                b.withValue(StructuredName.GIVEN_NAME, row[StructuredName.DISPLAY_NAME])
-            }
-            ops += b.build()
-        }
+        for (row in rows) ops += dataInsert(row).withValueBackReference(Data.RAW_CONTACT_ID, 0).build()
         val results = resolver.applyBatch(ContactsContract.AUTHORITY, ops)
         return results.firstOrNull()?.uri?.let { ContentUris.parseId(it) }
+    }
+
+    /** Replaces an entry's details with [rows]. As an ordinary app, so the address book's sync sends the change. */
+    fun update(rawId: Long, rows: List<SyncRow>) {
+        val mimes = SyncFields.mimes.toList()
+        val ops = ArrayList<ContentProviderOperation>()
+        ops += ContentProviderOperation.newDelete(Data.CONTENT_URI)
+            .withSelection("${Data.RAW_CONTACT_ID} = ? AND ${Data.MIMETYPE} IN (${mimes.joinToString { "?" }})", arrayOf(rawId.toString()) + mimes)
+            .build()
+        for (row in rows) ops += dataInsert(row).withValue(Data.RAW_CONTACT_ID, rawId).build()
+        resolver.applyBatch(ContactsContract.AUTHORITY, ops)
+    }
+
+    /** Deletes an entry; the address book's own sync removes it from its server. */
+    fun delete(rawId: Long) {
+        resolver.delete(ContentUris.withAppendedId(RawContacts.CONTENT_URI, rawId), null, null)
+    }
+
+    private fun dataInsert(row: SyncRow): ContentProviderOperation.Builder {
+        val b = ContentProviderOperation.newInsert(Data.CONTENT_URI).withValue(Data.MIMETYPE, row.mime)
+        row.values.forEach { (k, v) -> b.withValue(k, v) }
+        // A name with no parts (a company, an email address): keep it whole, or Android splits it.
+        if (row.mime == StructuredName.CONTENT_ITEM_TYPE && row.values.keys == setOf(StructuredName.DISPLAY_NAME)) {
+            b.withValue(StructuredName.GIVEN_NAME, row[StructuredName.DISPLAY_NAME])
+        }
+        return b
     }
 
     companion object {

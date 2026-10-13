@@ -30,11 +30,17 @@ object Settings {
         savePassword(ctx, password)
     }
 
-    /** The mailbox.org address book, and its name for the screen. */
-    fun serverBook(ctx: Context): String? = prefs(ctx).getString("serverBook", null)
-    fun serverBookName(ctx: Context): String = prefs(ctx).getString("serverBookName", null).orEmpty()
-    fun setServerBook(ctx: Context, url: String, name: String) =
-        prefs(ctx).edit().putString("serverBook", url).putString("serverBookName", name).apply()
+    /** The full address book (Clean Contacts), the one Rolodex Light uses. */
+    fun mainBook(ctx: Context): String? = prefs(ctx).getString("mainBook", null)
+    fun mainBookName(ctx: Context): String = prefs(ctx).getString("mainBookName", null).orEmpty()
+    fun setMainBook(ctx: Context, url: String, name: String) =
+        prefs(ctx).edit().putString("mainBook", url).putString("mainBookName", name).apply()
+
+    /** The LightOS-shaped copy (Contacts Light): one number per card. */
+    fun lightBook(ctx: Context): String? = prefs(ctx).getString("lightBook", null)
+    fun lightBookName(ctx: Context): String = prefs(ctx).getString("lightBookName", null).orEmpty()
+    fun setLightBook(ctx: Context, url: String, name: String) =
+        prefs(ctx).edit().putString("lightBook", url).putString("lightBookName", name).apply()
 
     /** LightOS's address book on the phone. */
     fun phoneBook(ctx: Context): PhoneBook? {
@@ -46,7 +52,7 @@ object Settings {
     fun setPhoneBook(ctx: Context, book: PhoneBook) =
         prefs(ctx).edit().putString("phoneBookName", book.name).putString("phoneBookType", book.type).apply()
 
-    /** On once the starting point is recorded; from then on only new contacts cross. */
+    /** On once the first build has finished. */
     fun running(ctx: Context): Boolean = prefs(ctx).getBoolean("running", false)
     fun setRunning(ctx: Context, on: Boolean) = prefs(ctx).edit().putBoolean("running", on).apply()
 

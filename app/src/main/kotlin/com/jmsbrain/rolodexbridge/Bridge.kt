@@ -1,119 +1,278 @@
 package com.jmsbrain.rolodexbridge
 
 import android.content.Context
+import android.provider.ContactsContract.CommonDataKinds.Phone
 import java.util.UUID
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
-/** How many contacts a one-time copy would move each way. */
-data class Missing(val toPhone: Int, val toServer: Int)
+/** What a build would do, for the screen before it starts. */
+data class Preview(
+    val people: Int,
+    val noNumber: Int,
+    val fromLightOs: Int,
+    val lightCards: Int,
+    val lightStrangers: Int,
+    val lightOsNow: Int,
+)
 
-/** Copies new contacts between LightOS's address book and the mailbox.org address book. */
+/**
+ * Clean Contacts is the full list. Contacts Light is a copy with one number per card, and LightOS's address book
+ * matches Contacts Light. Contacts made in LightOS are folded into Clean Contacts first.
+ */
 object Bridge {
     private val lock = Mutex()
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** What a running build is doing, for the screen; null when idle. */
+    val progress: StateFlow<String?> get() = _progress
+    private val _progress = MutableStateFlow<String?>(null)
 
     private enum class Mode {
-        /** After a contacts change: new LightOS contacts only, and no network unless there are some. */
+        /** After a contacts change: only if LightOS has entries the bridge didn't make. */
         Quick,
-        /** New contacts both ways. */
         Full,
-        /** One-time: every mailbox.org contact LightOS's address book doesn't have. */
-        AllToPhone,
-        /** One-time: every LightOS contact mailbox.org doesn't have. */
-        AllToServer,
+        /** The first time: also clears Contacts Light of cards the bridge didn't make. */
+        Build,
     }
 
-    /** Runs a pass. Returns an error message, or null. */
     suspend fun run(ctx: Context, full: Boolean): String? =
-        if (!Settings.running(ctx)) null else pass(ctx, if (full) Mode.Full else Mode.Quick).second
+        if (!Settings.running(ctx)) null else pass(ctx, if (full) Mode.Full else Mode.Quick, dryRun = false).second
 
-    /** Records where things stand: everything there now counts as already handled. */
-    suspend fun start(ctx: Context): String? = locked(ctx) { book, phone, dav, server ->
+    suspend fun preview(ctx: Context): Pair<Preview?, String?> = pass(ctx, Mode.Build, dryRun = true)
+
+    /** Starts the first build; it carries on if the screen closes, and picks up where it stopped if interrupted. */
+    fun build(ctx: Context, done: (String?) -> Unit) {
+        val app = ctx.applicationContext
+        scope.launch {
+            val error = pass(app, Mode.Build, dryRun = false).second
+            if (error == null) {
+                Settings.setRunning(app, true)
+                BridgeWork.start(app)
+            }
+            _progress.value = null
+            withContext(Dispatchers.Main) { done(error) }
+        }
+    }
+
+    private suspend fun pass(ctx: Context, mode: Mode, dryRun: Boolean): Pair<Preview?, String?> = locked(ctx) { env ->
+        val (book, phone, dav, mainBook, lightBook) = env
         val state = State.load(ctx)
-        state.seenPhone.clear()
-        state.seenPhone += phone.ids(book)
-        state.seenServer.clear()
-        state.seenServer += refreshCards(dav, server, state).keys
-        state.lastError = null
-        State.save(ctx, state)
-        Settings.setRunning(ctx, true)
-        null
-    }.second
+        val clean = State.loadClean(ctx)
+        fun save() {
+            if (!dryRun) State.save(ctx, state)
+        }
 
-    suspend fun missing(ctx: Context): Pair<Missing?, String?> {
-        val (toPhone, e1) = pass(ctx, Mode.AllToPhone, dryRun = true)
-        if (e1 != null) return null to e1
-        val (toServer, e2) = pass(ctx, Mode.AllToServer, dryRun = true)
-        if (e2 != null) return null to e2
-        return Missing(toPhone.toPhone.size, toServer.toServer.size) to null
-    }
+        val ids = phone.ids(book)
+        val ours = state.pieces.values.mapNotNull { it.rawId }.toSet()
+        state.ignored.retainAll(ids)
+        val loose = ids - ours - state.ignored
+        if (mode == Mode.Quick && loose.isEmpty()) {
+            save()
+            return@locked null
+        }
 
-    suspend fun copyAllToPhone(ctx: Context): String? = pass(ctx, Mode.AllToPhone).second
-    suspend fun copyAllToServer(ctx: Context): String? = pass(ctx, Mode.AllToServer).second
+        // ---- Clean Contacts ----
+        say("Reading ${Settings.mainBookName(ctx)}…")
+        refreshClean(dav, mainBook, clean)
+        if (!dryRun) State.saveClean(ctx, clean)
+        var docs = parse(clean)
+        var desired = piecesOf(docs)
+        var covered = desired.values.mapNotNull { it.phoneKey }.toSet()
 
-    private suspend fun pass(ctx: Context, mode: Mode, dryRun: Boolean = false): Pair<Plan, String?> {
-        var plan = Plan(emptyList(), emptyList(), emptySet(), emptySet())
-        val error = locked(ctx) { book, phone, dav, serverBook ->
-            val state = State.load(ctx)
-            val ids = phone.ids(book)
-            state.seenPhone.retainAll(ids)
-            val newIds = ids - state.seenPhone
-            if (mode == Mode.Quick && newIds.isEmpty()) {
-                State.save(ctx, state)
-                return@locked null
+        // LightOS entries with a number Clean Contacts doesn't have, or a new person with no number, go into Clean Contacts.
+        val looseRows = phone.read(loose)
+        val people = docs.values.filter { !it.isGroup }.map { Person.of(it.rows()) }
+        val newcomers = looseRows.filter { (_, rows) ->
+            val keys = phoneKeys(rows)
+            if (keys.isNotEmpty()) keys.any { it !in covered }
+            else Person.of(rows).let { p -> !p.isEmpty && people.none { it.matches(p) } }
+        }
+        val gathered = Splitter.gather(newcomers.values.toList())
+
+        if (dryRun) {
+            val newKeys = gathered.flatMap { phoneKeys(it.rows) }.filter { it !in covered }.toSet()
+            val strangers = dav.list(lightBook).keys.map { key(it) }.toSet() - state.pieces.values.mapNotNull { it.lightHref?.let(::key) }.toSet()
+            return@locked Preview(
+                people = people.size,
+                noNumber = docs.values.count { !it.isGroup && it.rows().none { r -> r.mime == Phone.CONTENT_ITEM_TYPE } },
+                fromLightOs = gathered.size,
+                lightCards = desired.size + newKeys.size,
+                lightStrangers = strangers.size,
+                lightOsNow = ids.size,
+            )
+        }
+
+        if (gathered.isNotEmpty()) {
+            gathered.forEachIndexed { i, g ->
+                say("Adding LightOS contacts to ${Settings.mainBookName(ctx)}: ${i + 1} of ${gathered.size}")
+                addToClean(dav, mainBook, clean, docs, g, state)
             }
+            State.saveClean(ctx, clean)
+            docs = parse(clean)
+            desired = piecesOf(docs)
+            covered = desired.values.mapNotNull { it.phoneKey }.toSet()
+        }
 
-            val urls = HashMap<String, String>()
-            val server = refreshCards(dav, serverBook, state, urls)
-            val rows = phone.read(if (mode == Mode.Quick) newIds else ids)
-            val people = rows.mapValues { Person.of(it.value) }
-            plan = when (mode) {
-                Mode.Quick -> Planner.plan(people, server, state.seenPhone, server.keys)
-                Mode.Full -> Planner.plan(people, server, state.seenPhone, state.seenServer)
-                Mode.AllToPhone -> Planner.plan(people, server, ids, emptySet())
-                Mode.AllToServer -> Planner.plan(people, server, emptySet(), server.keys)
+        // ---- Contacts Light ----
+        val lightRaw = dav.list(lightBook)
+        val listing = lightRaw.mapKeys { key(it.key) }
+        val lightUrls = lightRaw.keys.associateBy { key(it) }
+        if (mode == Mode.Build) {
+            val mine = state.pieces.values.mapNotNull { it.lightHref?.let(::key) }.toSet()
+            val strangers = listing.keys - mine
+            strangers.forEachIndexed { i, k ->
+                say("Clearing ${Settings.lightBookName(ctx)}: ${i + 1} of ${strangers.size}")
+                dav.delete(lightUrls.getValue(k), null)
             }
-            if (dryRun) return@locked null
+        }
+        var n = 0
+        for (p in desired.values) {
+            n++
+            val m = state.pieces.getOrPut(p.key) { Managed() }
+            val exists = m.lightHref?.let { key(it) in listing } == true
+            if (exists && m.lightHash == p.hash) continue
+            say("Updating ${Settings.lightBookName(ctx)}: $n of ${desired.size}")
+            if (exists) {
+                m.lightEtag = putLight(dav, m.lightHref!!, p, m.lightEtag ?: listing[key(m.lightHref!!)])
+            } else {
+                val (url, etag) = createLight(dav, lightBook, p)
+                m.lightHref = url
+                m.lightEtag = etag
+            }
+            m.lightHash = p.hash
+            if (n % 20 == 0) save()
+        }
 
-            for (id in plan.toServer) {
-                val href = upload(dav, serverBook, rows[id].orEmpty())
-                state.seenServer += key(href.first)
-                state.cards[key(href.first)] = CachedCard(href.second, people.getValue(id))
-                state.seenPhone += id
-                state.sentToServer++
-                State.save(ctx, state)
-            }
-            for (chunk in plan.toPhone.chunked(50)) {
-                val cards = dav.multiget(serverBook, chunk.map { urls.getValue(it) }).associateBy { key(it.url) }
-                for (k in chunk) {
-                    val doc = cards[k]?.let { VCardDoc.parse(it.text).firstOrNull() } ?: continue
-                    phone.add(book, doc.rows())?.let { state.seenPhone += it }
-                    state.seenServer += k
-                    state.addedToPhone++
+        // ---- LightOS ----
+        val present = phone.ids(book)
+        val byNumber = HashMap<String, MutableList<Long>>()
+        looseRows.forEach { (id, rows) -> if (id in present) phoneKeys(rows).forEach { byNumber.getOrPut(it) { ArrayList() } += id } }
+        val adopted = HashSet<Long>()
+        n = 0
+        for (p in desired.values) {
+            n++
+            val m = state.pieces.getValue(p.key)
+            var has = m.rawId != null && m.rawId in present
+            if (!has) {
+                // Reuse a LightOS entry with this number instead of adding another.
+                val reuse = p.phoneKey?.let { k -> byNumber[k]?.firstOrNull { it !in adopted } }
+                if (reuse != null) {
+                    adopted += reuse
+                    m.rawId = reuse
+                    m.rawHash = null
+                    has = true
                 }
-                State.save(ctx, state)
             }
-            state.seenPhone += plan.knownPhone
-            state.seenServer += plan.knownServer
-            state.lastRun = System.currentTimeMillis()
-            state.lastError = null
-            State.save(ctx, state)
-            null
-        }.second
-        return plan to error
+            when {
+                has && m.rawHash == p.hash -> continue
+                has -> {
+                    say("Updating LightOS: $n of ${desired.size}")
+                    phone.update(m.rawId!!, p.rows)
+                }
+                // Gone from LightOS but unchanged here: deleted on the phone, so leave it deleted.
+                m.rawId != null && m.rawHash == p.hash && mode != Mode.Build -> continue
+                else -> {
+                    say("Adding to LightOS: $n of ${desired.size}")
+                    m.rawId = phone.add(book, p.rows)
+                }
+            }
+            m.rawHash = p.hash
+            if (n % 20 == 0) save()
+        }
+
+        // Pieces whose contact or number went away.
+        for (k in state.pieces.keys - desired.keys) {
+            val m = state.pieces.getValue(k)
+            m.lightHref?.let { dav.delete(it, null) }
+            m.rawId?.let { if (it in present) phone.delete(it) }
+            state.pieces.remove(k)
+        }
+
+        // LightOS entries left over. The first build replaces the book, so duplicates of numbers that now have an entry go;
+        // after that, nothing typed on the phone is deleted.
+        for ((id, rows) in looseRows) {
+            if (id in adopted || id !in present) continue
+            val keys = phoneKeys(rows)
+            if (mode == Mode.Build && keys.isNotEmpty() && keys.all { it in covered }) phone.delete(id) else state.ignored += id
+        }
+
+        state.people = docs.values.count { !it.isGroup }
+        state.lastRun = System.currentTimeMillis()
+        state.lastError = null
+        save()
+        null
     }
 
-    /** Creates a card from LightOS's rows. Returns its URL and ETag. */
-    private fun upload(dav: CardDav, book: String, rows: List<SyncRow>): Pair<String, String?> {
+    // ---- Clean Contacts ----
+
+    /** Brings [clean] up to date with the server, downloading only cards that changed. */
+    private fun refreshClean(dav: CardDav, book: String, clean: MutableMap<String, CleanCard>) {
+        val listing = dav.list(book)
+        val byKey = listing.keys.associateBy { key(it) }
+        clean.keys.retainAll(byKey.keys)
+        val stale = byKey.filter { (k, url) -> clean[k]?.let { it.etag == null || it.etag != listing[url] } ?: true }
+        for (chunk in stale.values.chunked(100)) {
+            for (f in dav.multiget(book, chunk)) clean[key(f.url)] = CleanCard(f.url, f.etag, f.text)
+        }
+    }
+
+    private fun parse(clean: Map<String, CleanCard>): Map<String, VCardDoc> =
+        clean.mapNotNull { (k, c) -> VCardDoc.parse(c.text).firstOrNull()?.let { k to it } }.toMap()
+
+    private fun piecesOf(docs: Map<String, VCardDoc>): Map<String, Piece> =
+        docs.filter { !it.value.isGroup }.flatMap { (k, d) -> Splitter.pieces(k, d.rows()) }.associateBy { it.key }
+
+    /** Adds the numbers in [g] to the Clean Contacts card with the same name, or makes a new card. */
+    private fun addToClean(dav: CardDav, book: String, clean: MutableMap<String, CleanCard>, docs: Map<String, VCardDoc>, g: Gathered, state: State) {
+        val nameKey = Person.nameKey(g.name)
+        val target = docs.entries.firstOrNull { (_, d) -> !d.isGroup && nameKey != null && nameKey in Person.of(d.rows()).names }
+        val phones = g.rows.filter { it.mime == Phone.CONTENT_ITEM_TYPE }
+        val url: String
+        val sent: List<String>
+        if (target != null) {
+            val card = clean.getValue(target.key)
+            val existing = target.value.rows().filter { it.mime == Phone.CONTENT_ITEM_TYPE }
+            val have = phoneKeys(existing).toSet()
+            val add = phones.filter { p -> Person.phoneKey(p[Phone.NUMBER].orEmpty()).let { it == null || it !in have } }
+            if (add.isEmpty()) return
+            url = card.url
+            sent = phoneKeys(add)
+            dav.put(url, target.value.patched(mapOf(Phone.CONTENT_ITEM_TYPE to existing + add)).text(), card.etag, create = false)
+        } else {
+            val uid = UUID.randomUUID().toString()
+            url = book.trimEnd('/') + "/" + uid + ".vcf"
+            sent = phoneKeys(phones)
+            dav.put(url, VCardDoc.fromRows(g.rows, uid).text(), null, create = true)
+        }
+        // mailbox.org has a fixed number of slots per kind of number; check what it kept.
+        val stored = dav.get(url) ?: return
+        clean[key(url)] = CleanCard(url, stored.etag, stored.text)
+        val kept = VCardDoc.parse(stored.text).firstOrNull()?.rows()?.let { phoneKeys(it).toSet() }.orEmpty()
+        val lost = sent.filter { it !in kept }
+        if (lost.isNotEmpty()) {
+            state.problems += "The server didn't keep ${lost.size} number(s) for ${g.name}; it has no room for more of that kind."
+            while (state.problems.size > 20) state.problems.removeAt(0)
+        }
+    }
+
+    // ---- Contacts Light ----
+
+    private fun createLight(dav: CardDav, book: String, p: Piece): Pair<String, String?> {
         var attempt = 0
         while (true) {
             val uid = UUID.randomUUID().toString()
             val url = book.trimEnd('/') + "/" + uid + ".vcf"
             try {
-                return url to dav.put(url, VCardDoc.fromRows(rows, uid).text(), null, create = true)
+                return url to dav.put(url, VCardDoc.fromRows(p.rows, uid).text(), null, create = true)
             } catch (e: DavError) {
                 // 412: that name is taken; try another.
                 if (e.status != 412 || ++attempt == 3) throw e
@@ -121,35 +280,43 @@ object Bridge {
         }
     }
 
-    /** The mailbox.org book: href key → person. Only cards that changed since last time are downloaded. */
-    private fun refreshCards(dav: CardDav, book: String, state: State, urls: MutableMap<String, String> = HashMap()): Map<String, Person> {
-        val listing = dav.list(book).mapKeys { (url, _) -> key(url).also { urls[it] = url } }
-        state.cards.keys.retainAll(listing.keys)
-        val stale = listing.filter { (k, etag) -> state.cards[k]?.let { it.etag == null || it.etag != etag } ?: true }.keys
-        for (chunk in stale.chunked(100)) {
-            for (f in dav.multiget(book, chunk.map { urls.getValue(it) })) {
-                val doc = VCardDoc.parse(f.text).firstOrNull() ?: continue
-                // Contact groups aren't people; an empty person is never copied.
-                val person = if (doc.isGroup) Person(emptySet(), emptySet(), emptySet()) else Person.of(doc.rows())
-                state.cards[key(f.url)] = CachedCard(f.etag, person)
+    /** Overwrites a Contacts Light card; the bridge owns these, so a change made elsewhere is replaced. */
+    private fun putLight(dav: CardDav, url: String, p: Piece, etag: String?): String? {
+        val uid = url.substringAfterLast('/').removeSuffix(".vcf")
+        val text = VCardDoc.fromRows(p.rows, uid).text()
+        return try {
+            dav.put(url, text, etag, create = false)
+        } catch (e: DavError) {
+            when (e.status) {
+                412 -> dav.put(url, text, dav.get(url)?.etag, create = false)
+                404 -> dav.put(url, text, null, create = true)
+                else -> throw e
             }
         }
-        return listing.keys.associateWith { state.cards[it]?.person ?: Person(emptySet(), emptySet(), emptySet()) }
     }
 
-    /** One pass at a time, with everything it needs. Errors become the returned message and are saved. */
-    private suspend fun <T> locked(
-        ctx: Context,
-        block: suspend (PhoneBook, PhoneContacts, CardDav, String) -> T?,
-    ): Pair<T?, String?> = lock.withLock {
+    // ---- plumbing ----
+
+    private fun phoneKeys(rows: List<SyncRow>): List<String> =
+        rows.filter { it.mime == Phone.CONTENT_ITEM_TYPE }.mapNotNull { Person.phoneKey(it[Phone.NUMBER].orEmpty()) }.distinct()
+
+    private fun say(text: String) {
+        _progress.value = text
+    }
+
+    private data class Env(val book: PhoneBook, val phone: PhoneContacts, val dav: CardDav, val mainBook: String, val lightBook: String)
+
+    /** One pass at a time. Errors become the returned message and are saved. */
+    private suspend fun <T> locked(ctx: Context, block: suspend (Env) -> T?): Pair<T?, String?> = lock.withLock {
         withContext(Dispatchers.IO) {
             val book = Settings.phoneBook(ctx) ?: return@withContext null to "Choose LightOS's address book."
-            val serverBook = Settings.serverBook(ctx) ?: return@withContext null to "Choose a mailbox.org address book."
+            val main = Settings.mainBook(ctx) ?: return@withContext null to "Choose the full address book."
+            val light = Settings.lightBook(ctx) ?: return@withContext null to "Choose the LightOS-shaped address book."
             val user = Settings.user(ctx)
             val password = Settings.password(ctx)
             if (user == null || password == null) return@withContext null to "Sign in again."
             try {
-                block(book, PhoneContacts(ctx.contentResolver), CardDav(user, password), serverBook) to null
+                block(Env(book, PhoneContacts(ctx.contentResolver), CardDav(user, password), main, light)) to null
             } catch (e: DavError) {
                 fail(ctx, e.message ?: "Couldn't reach the server.")
             } catch (e: SecurityException) {
