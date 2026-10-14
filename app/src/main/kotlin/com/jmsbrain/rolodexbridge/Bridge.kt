@@ -63,6 +63,16 @@ object Bridge {
         }
     }
 
+    /** A full pass that carries on if the screen closes. */
+    fun check(ctx: Context, done: (String?) -> Unit) {
+        val app = ctx.applicationContext
+        scope.launch {
+            val error = run(app, full = true)
+            _progress.value = null
+            withContext(Dispatchers.Main) { done(error) }
+        }
+    }
+
     private suspend fun pass(ctx: Context, mode: Mode, dryRun: Boolean): Pair<Preview?, String?> = locked(ctx) { env ->
         val (book, phone, dav, mainBook, lightBook) = env
         val state = State.load(ctx)

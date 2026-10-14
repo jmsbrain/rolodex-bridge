@@ -20,15 +20,15 @@ data class Gathered(val name: String, val rows: List<SyncRow>)
 
 object Splitter {
     /**
-     * LightOS shows one number per contact, so a contact with several numbers becomes one entry per number,
-     * named "Ada Lovelace (Mobile 1)", "Ada Lovelace (Work)". Emails, addresses and the rest go on the first
+     * LightOS shows one number per contact, so a contact becomes one entry per number, named
+     * "Ada Lovelace (Mobile 1)", "Ada Lovelace (Work)". A lone number is labelled too ("Ada Lovelace (Mobile)"),
+     * so LightOS's list tells these apart from other apps' entries. Emails, addresses and the rest go on the first
      * entry only. Contacts with no number aren't included.
      */
     fun pieces(cardKey: String, rows: List<SyncRow>): List<Piece> {
         val phones = rows.filter { it.mime == Phone.CONTENT_ITEM_TYPE && !it[Phone.NUMBER].isNullOrBlank() }
             .distinctBy { Person.phoneKey(it[Phone.NUMBER]!!) ?: it[Phone.NUMBER] }
         if (phones.isEmpty()) return emptyList()
-        if (phones.size == 1) return listOf(Piece(pieceKey(cardKey, phones[0]), rows.filter { it.mime != Phone.CONTENT_ITEM_TYPE } + phones))
 
         val name = rows.firstOrNull { it.mime == StructuredName.CONTENT_ITEM_TYPE }
         val base = displayName(rows)

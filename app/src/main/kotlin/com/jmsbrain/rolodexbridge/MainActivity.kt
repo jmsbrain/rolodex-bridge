@@ -244,7 +244,6 @@ private fun BuildScreen(activity: MainActivity, onDone: () -> Unit, onBack: () -
 
 @Composable
 private fun StatusScreen(ctx: Context, onSignOut: () -> Unit) {
-    val scope = rememberCoroutineScope()
     var state by remember { mutableStateOf(State.load(ctx)) }
     var busy by remember { mutableStateOf(false) }
     var confirm by remember { mutableStateOf(false) }
@@ -254,8 +253,8 @@ private fun StatusScreen(ctx: Context, onSignOut: () -> Unit) {
     fun check() {
         busy = true
         error = null
-        scope.launch {
-            error = Bridge.run(ctx, full = true)
+        Bridge.check(ctx) { e ->
+            error = e
             state = State.load(ctx)
             busy = false
         }

@@ -8,7 +8,7 @@ LightOS holds one phone number per contact. The bridge gives it exactly that: a 
 - Ada Lovelace (Mobile 2)
 - Ada Lovelace (Work)
 
-A contact with one number keeps its plain name. Contacts with no number are left out of LightOS.
+A contact with one number is labelled too ("Abbie Vaughn (Mobile)"), so any entry without a label in LightOS's list belongs to another app (WhatsApp, Molly). Contacts with no number are left out of LightOS.
 
 A small regular Android app, since Light SDK tools can't read the phone's contacts.
 

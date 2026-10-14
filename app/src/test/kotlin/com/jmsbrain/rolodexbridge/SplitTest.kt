@@ -45,12 +45,13 @@ class SplitTest {
 
     // ---- splitting ----
 
-    @Test fun oneNumberStaysWhole() {
+    @Test fun oneNumberIsLabelledToo() {
         val rows = listOf(name("Ada Lovelace", "Ada", "Lovelace"), phone("919-555-0101", 2), email("ada@example.com"))
         val pieces = Splitter.pieces("card", rows)
         assertEquals(1, pieces.size)
-        assertEquals("Ada Lovelace", displayOf(pieces[0]))
-        assertEquals(rows.map { it.sortKey }.sorted(), pieces[0].rows.map { it.sortKey }.sorted())
+        assertEquals("Ada Lovelace (Mobile)", displayOf(pieces[0]))
+        // Everything else stays on it.
+        assertEquals(1, pieces[0].rows.count { it.mime == Email.CONTENT_ITEM_TYPE })
     }
 
     @Test fun noNumberIsLeftOut() {
